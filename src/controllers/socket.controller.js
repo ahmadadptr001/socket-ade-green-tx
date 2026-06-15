@@ -1,0 +1,1077 @@
+const { createStreamToken } = require("../services/stream.service");
+
+const onlineDrivers = new Map(); // id -> { id, status, coords, socketId, car_information }
+const rides = new Map(); // rideId -> { rideId, customerId, driverId, status, destination, customerLocation? }
+const socketIdToDriverId = new Map(); // socketId -> driverId (reverse lookup)
+const onlineCustomers = new Map(); // socketId -> { socketId, lastSeen, meta }
+
+// CHAT additions:
+const userSockets = new Map(); // userId -> Set(socketId)
+const messages = new Map(); // roomId -> [message]
+
+// CALL addition
+const activeCalls = new Map();
+// callId -> {
+//   callId,
+//   fromUserId,
+//   toUserId,
+//   roomId,
+//   status: 'ringing' | 'accepted' | 'rejected' | 'ended',
+//   createdAt
+// }
+
+function now() {
+  return new Date().toISOString();
+}
+
+function log(...args) {
+  try {
+    console.log(`[socket] ${now()} -`, ...args);
+  } catch {}
+}
+
+// optional: periodic debug log every 10s
+setInterval(() => {
+  try {
+    log("periodic counts", {
+      drivers: onlineDrivers.size,
+      customers: onlineCustomers.size,
+      rides: rides.size,
+      users: userSockets.size,
+    });
+  } catch {}
+}, 10 * 1000);
+
+module.exports = (io) => {
+  // helper: broadcast daftar driver ke semua client
+  function emitDriverList() {
+    try {
+      io.emit("driver:list", Array.from(onlineDrivers.values()));
+    } catch (e) {
+      log("emitDriverList error", e?.message ?? e);
+    }
+  }
+
+  // normalize coords helper
+  function normalizeCoords(coords) {
+    if (!coords) return null;
+    const lat = Number(coords.lat ?? coords.latitude ?? coords.latitud ?? NaN);
+    const lng = Number(coords.lng ?? coords.longitude ?? coords.long ?? NaN);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    return { lat, lng };
+  }
+
+  // --- CHAT helper functions ---
+  function registerSocketForUser(userId, socketId) {
+    if (!userId) return;
+    if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+    userSockets.get(userId).add(socketId);
+  }
+
+  function unregisterSocketForUser(userId, socketId) {
+    if (!userId) return;
+    const set = userSockets.get(userId);
+    if (!set) return;
+    set.delete(socketId);
+    if (set.size === 0) userSockets.delete(String(userId));
+  }
+
+  function getSocketIdsForUser(userId) {
+    return Array.from(userSockets.get(userId) || []);
+  }
+
+  function persistMessage(msg) {
+    const list = messages.get(msg.roomId) || [];
+    list.push(msg);
+    // optional: keep only last N per room to bound memory
+    const MAX_PER_ROOM = 1000;
+    if (list.length > MAX_PER_ROOM) list.splice(0, list.length - MAX_PER_ROOM);
+    messages.set(msg.roomId, list);
+    return msg;
+  }
+
+  io.on("connection", (socket) => {
+    log("connection established", {
+      socketId: socket.id,
+      handshake: socket.handshake?.auth ?? null,
+    });
+
+    // if client provided role in handshake.auth, capture it
+    try {
+      const auth = socket.handshake?.auth;
+      if (auth && auth.role === "customer") {
+        onlineCustomers.set(socket.id, {
+          socketId: socket.id,
+          lastSeen: now(),
+          meta: auth,
+        });
+        log("connection identified as customer via handshake.auth", {
+          socketId: socket.id,
+          meta: auth,
+        });
+      }
+
+      // auto-register userId to userSockets if provided in handshake
+      if (auth && (auth.userId || auth.id)) {
+        const userId = auth.userId ?? auth.id;
+        socket.userId = userId;
+        registerSocketForUser(userId, socket.id);
+        log("auto-registered user via handshake", {
+          userId,
+          socketId: socket.id,
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // CUSOMER START CALL
+    socket.on("call:invite", ({ toUserId, roomId }, ack) => {
+      try {
+        if (!socket.userId || !toUserId || !roomId) {
+          return ack?.({ ok: false, reason: "invalid_payload" });
+        }
+
+        const callId = `call_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+
+        const call = {
+          callId,
+          fromUserId: socket.userId,
+          toUserId,
+          roomId,
+          status: "ringing",
+          createdAt: now(),
+        };
+
+        activeCalls.set(callId, call);
+
+        // kirim ke semua socket target user (driver)
+        const targetSockets = getSocketIdsForUser(String(toUserId));
+        targetSockets.forEach((sid) => {
+          io.to(sid).emit("call:incoming", {
+            callId,
+            fromUserId: socket.userId,
+            roomId,
+          });
+        });
+
+        log("call:invite sent", call);
+
+        ack?.({ ok: true, callId });
+      } catch (e) {
+        log("call:invite error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // DRIVER ACCEPT CALL
+    socket.on("call:accept", ({ callId }, ack) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) {
+          return ack?.({ ok: false, reason: "call_not_found" });
+        }
+
+        if (String(call.toUserId) !== String(socket.userId)) {
+          return ack?.({ ok: false, reason: "not_authorized" });
+        }
+
+        call.status = "accepted";
+        activeCalls.set(callId, call);
+
+        // notify caller
+        const callerSockets = getSocketIdsForUser(String(call.fromUserId));
+        callerSockets.forEach((sid) => {
+          io.to(sid).emit("call:accepted", {
+            callId,
+            roomId: call.roomId,
+          });
+        });
+
+        log("call accepted", call);
+
+        ack?.({ ok: true });
+      } catch (e) {
+        log("call:accept error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // DRIVER REJECT CALL
+    socket.on("call:reject", ({ callId }, ack) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) {
+          return ack?.({ ok: false, reason: "call_not_found" });
+        }
+
+        call.status = "rejected";
+        activeCalls.set(callId, call);
+
+        const callerSockets = getSocketIdsForUser(String(call.fromUserId));
+        callerSockets.forEach((sid) => {
+          io.to(sid).emit("call:rejected", { callId });
+        });
+
+        activeCalls.delete(callId);
+
+        log("call rejected", call);
+
+        ack?.({ ok: true });
+      } catch (e) {
+        log("call:reject error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // END CALL
+    socket.on("call:end", ({ callId }, ack) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) return;
+
+        const targets = [
+          ...getSocketIdsForUser(String(call.fromUserId)),
+          ...getSocketIdsForUser(String(call.toUserId)),
+        ];
+
+        targets.forEach((sid) => {
+          io.to(sid).emit("call:ended", { callId });
+        });
+
+        activeCalls.delete(callId);
+
+        log("call ended", call);
+
+        ack?.({ ok: true });
+      } catch (e) {
+        log("call:end error", e?.message ?? e);
+        ack?.({ ok: false });
+      }
+    });
+
+    // --- CHAT: optional explicit register (client can emit after connect) ---
+    socket.on("chat:register", ({ userId, role }, ack) => {
+      try {
+        if (!userId) {
+          return ack?.({ ok: false, message: "userId required" });
+        }
+
+        // simpan ke socket memory
+        socket.userId = String(userId);
+        socket.role = role || "user";
+
+        registerSocketForUser(socket.userId, socket.id);
+
+        // 🔑 BUAT STREAM TOKEN
+        const streamToken = createStreamToken(socket.userId);
+
+        log("chat:register success", {
+          userId: socket.userId,
+          role: socket.role,
+          socketId: socket.id,
+        });
+
+        // kirim ke client
+        ack?.({
+          ok: true,
+          stream: {
+            userId: socket.userId,
+            token: streamToken,
+            apiKey: process.env.STREAM_API_KEY,
+          },
+        });
+      } catch (err) {
+        log("chat:register error", err.message);
+        ack?.({ ok: false, message: err.message });
+      }
+    });
+
+    // --- customer set profile (existing) ---
+    socket.on("customer:profile", (payload, ack) => {
+      try {
+        const { id, ...profile } = payload || {};
+
+        const prev = onlineCustomers.get(socket.id) || {};
+        const meta = { ...(prev.meta || {}), id, profile };
+        onlineCustomers.set(socket.id, {
+          socketId: socket.id,
+          lastSeen: now(),
+          meta,
+        });
+
+        // if payload includes id, register userSockets for chat lookup
+        if (id) {
+          socket.userId = id;
+          registerSocketForUser(String(id), socket.id);
+        }
+
+        log("customer:profile set", { socketId: socket.id, id, profile });
+
+        // broadcast to all drivers (or to room if you prefer)
+        // send flat { id, profile } for discovery and also nested to rooms when booking
+        io.emit("customer:profile:update", { id, profile });
+
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (e) {
+        log("customer:profile error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // customer offline (existing)
+    socket.on("customer:offline", ({ userId }, ack) => {
+      try {
+        if (!userId) return ack?.({ ok: true });
+
+        for (const [sId, info] of onlineCustomers.entries()) {
+          const metaId = info?.meta?.id ?? info?.meta?.customerId;
+          if (String(metaId) === String(userId)) {
+            unregisterSocketForUser(String(userId), sId);
+            onlineCustomers.delete(sId);
+          }
+        }
+
+        ack?.({ ok: true });
+      } catch (e) {
+        ack?.({ ok: false });
+      }
+    });
+
+    // driver declare online (existing) - also register for chat mapping
+    socket.on("driver:online", ({ id, coords, car } = {}) => {
+      try {
+        const entry = {
+          id,
+          status: "online",
+          coords: normalizeCoords(coords) || null,
+          car_information: car || null,
+          socketId: socket.id,
+        };
+        onlineDrivers.set(id, entry);
+        socketIdToDriverId.set(socket.id, id);
+
+        // register mapping for chat
+        if (id) {
+          socket.userId = id;
+          registerSocketForUser(String(id), socket.id);
+        }
+
+        log("driver:online", {
+          driverId: id,
+          coords: entry.coords,
+          socketId: socket.id,
+          totalOnlineDrivers: onlineDrivers.size,
+        });
+        emitDriverList();
+      } catch (e) {
+        log("driver:online error", e?.message ?? e);
+      }
+    });
+
+    // driver go offline (existing) - also unregister chat mapping
+    socket.on("driver:offline", ({ id } = {}) => {
+      try {
+        const removed = onlineDrivers.delete(id);
+        for (const [sId, dId] of socketIdToDriverId.entries()) {
+          if (dId === id) socketIdToDriverId.delete(sId);
+        }
+
+        // unregister from userSockets
+        if (id) unregisterSocketForUser(String(id), socket.id);
+
+        log("driver:offline", {
+          driverId: id,
+          removed,
+          totalOnlineDrivers: onlineDrivers.size,
+        });
+        emitDriverList();
+      } catch (e) {
+        log("driver:offline error", e?.message ?? e);
+      }
+    });
+
+    // driver location update (existing)
+    socket.on("driver:location", ({ rideId, id, coords } = {}) => {
+      try {
+        const normalized = normalizeCoords(coords);
+        const d = onlineDrivers.get(id);
+        if (d) {
+          const updated = {
+            ...d,
+            coords: normalized || d.coords,
+            socketId: socket.id,
+          };
+          onlineDrivers.set(id, updated);
+          socketIdToDriverId.set(socket.id, id); // refresh mapping
+          log("driver:location", {
+            driverId: id,
+            rideId,
+            coords: normalized,
+            totalOnlineDrivers: onlineDrivers.size,
+          });
+
+          if (rideId) {
+            io.to(rideId).emit("location:update", {
+              role: "driver",
+              id,
+              coords: normalized,
+              rideId,
+            });
+          } else {
+            emitDriverList();
+          }
+        } else {
+          log("driver:location - driver not found", { id });
+        }
+      } catch (e) {
+        log("driver:location error", e?.message ?? e);
+      }
+    });
+
+    // customer location update (existing)
+    socket.on("customer:location", ({ rideId, id, coords, ...rest } = {}) => {
+      try {
+        const normalized = normalizeCoords(coords);
+
+        // update or create onlineCustomers entry and store lastCoords
+        const prev = onlineCustomers.get(socket.id) || {};
+        const meta = {
+          ...(prev.meta || {}),
+          id: id ?? prev.meta?.id ?? null,
+          lastCoords: normalized,
+          ...rest,
+        };
+        onlineCustomers.set(socket.id, {
+          socketId: socket.id,
+          lastSeen: now(),
+          meta,
+        });
+
+        // ensure chat mapping if id provided
+        if (id) {
+          socket.userId = id;
+          registerSocketForUser(String(id), socket.id);
+        }
+
+        log("customer:location received", {
+          socketId: socket.id,
+          customerId: id,
+          rideId,
+          coords: normalized,
+          ...rest,
+        });
+
+        // persist snapshot into ride record if ride exists
+        if (rideId && rides.has(rideId)) {
+          const r = rides.get(rideId);
+          r.customerLocation = normalized;
+          rides.set(rideId, r);
+        }
+
+        // emit to room with explicit role and normalized coords
+        if (rideId) {
+          io.to(rideId).emit("location:update", {
+            role: "customer",
+            id,
+            coords: normalized,
+            rideId,
+          });
+        } else {
+          log("customer:location - missing rideId", { customerId: id });
+        }
+      } catch (e) {
+        log("customer:location error", e?.message ?? e);
+      }
+    });
+
+    // client requests snapshot of drivers (existing)
+    socket.on("drivers:request", (payload = {}) => {
+      try {
+        const prev = onlineCustomers.get(socket.id) || {};
+
+        // Merge meta: pertahankan data lama, timpa dengan payload baru jika ada
+        const updatedMeta = {
+          ...(prev.meta || {}),
+          ...(payload || {}),
+        };
+
+        onlineCustomers.set(socket.id, {
+          socketId: socket.id,
+          lastSeen: now(),
+          meta: updatedMeta,
+        });
+
+        log("drivers:request - meta merged", {
+          socketId: socket.id,
+          meta: updatedMeta,
+        });
+        socket.emit("driver:list", Array.from(onlineDrivers.values()));
+      } catch (e) {
+        log("drivers:request error", e?.message ?? e);
+      }
+    });
+
+    // ------------------------
+    // --- CHAT: core events ---
+    // ------------------------
+
+    // join chat room
+    socket.on("chat:join", (roomId, ack) => {
+      try {
+        if (!roomId) return ack?.({ ok: false, reason: "invalid_room" });
+        socket.join(roomId);
+        log("chat:join", {
+          socketId: socket.id,
+          userId: socket.userId,
+          roomId,
+        });
+        ack?.({ ok: true });
+      } catch (e) {
+        log("chat:join error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // send message
+    socket.on("chat:send", (payload = {}, ack) => {
+      try {
+        const { roomId, to, text, attachments } = payload || {};
+        if (!roomId || (!text && !attachments)) {
+          return ack?.({ ok: false, reason: "invalid_payload" });
+        }
+
+        const msg = {
+          id: `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+          roomId,
+          from: socket.userId ?? null,
+          to: Array.isArray(to) ? to : to ? [to] : [],
+          text: text ?? null,
+          attachments: attachments ?? null,
+          createdAt: now(),
+          status: "sent",
+        };
+
+        // persist (in-memory)
+        persistMessage(msg);
+
+        // emit to room
+        io.to(roomId).emit("chat:message", msg);
+
+        // fallback: also emit directly to recipient sockets (by userId)
+        (msg.to || []).forEach((uid) => {
+          const sids = getSocketIdsForUser(String(uid));
+          sids.forEach((sid) => {
+            try {
+              io.to(sid).emit("chat:message", msg);
+            } catch (e) {
+              // ignore per-socket emit errors
+            }
+          });
+        });
+
+        log("chat:send", {
+          roomId: msg.roomId,
+          from: msg.from,
+          to: msg.to,
+          id: msg.id,
+        });
+
+        ack?.({ ok: true, messageId: msg.id });
+      } catch (e) {
+        log("chat:send error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // chat history
+    socket.on("chat:history", ({ roomId, limit = 50, before } = {}, ack) => {
+      try {
+        if (!roomId) return ack?.({ ok: false, reason: "invalid_room" });
+        const list = messages.get(roomId) || [];
+        // naive pagination: return last `limit` messages, ignoring `before` for now
+        const result = list.slice(-limit);
+        ack?.({ ok: true, messages: result });
+      } catch (e) {
+        log("chat:history error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // typing indicator
+    socket.on("chat:typing", ({ roomId, isTyping } = {}) => {
+      try {
+        if (!roomId) return;
+        socket.to(roomId).emit("chat:typing", {
+          roomId,
+          from: socket.userId,
+          isTyping: !!isTyping,
+        });
+      } catch (e) {
+        log("chat:typing error", e?.message ?? e);
+      }
+    });
+
+    // read receipt
+    socket.on("chat:read", ({ roomId, messageIds = [] } = {}) => {
+      try {
+        if (!roomId || !Array.isArray(messageIds)) return;
+        const list = messages.get(roomId) || [];
+        for (const m of list) {
+          if (messageIds.includes(m.id)) m.status = "read";
+        }
+        io.to(roomId).emit("chat:read", {
+          roomId,
+          reader: socket.userId,
+          messageIds,
+        });
+      } catch (e) {
+        log("chat:read error", e?.message ?? e);
+      }
+    });
+
+    // ------------------------
+    // --- existing ride events continue ---
+    // ------------------------
+
+    // Driver secara manual klik "Terima" di HP-nya
+    socket.on("ride:accept", ({ rideId }, ack) => {
+      try {
+        const r = rides.get(rideId);
+        if (!r) return ack?.({ ok: false, reason: "ride_not_found" });
+
+        r.status = "accepted"; // Ubah status dari booked ke accepted
+        rides.set(rideId, r);
+
+        // Beritahu PENUMPANG bahwa driver sudah fiks menerima
+        io.to(rideId).emit("ride:status", {
+          rideId,
+          status: "accepted",
+          driverId: r.driverId,
+        });
+
+        log("ride:accepted by driver", { rideId, driverId: r.driverId });
+        ack?.({ ok: true });
+      } catch (e) {
+        ack?.({ ok: false });
+      }
+    });
+
+    // customer book driver (with simple in-memory lock)
+    socket.on(
+      "ride:book",
+      ({ rideId, location_if_needed, customerId, preferredDriverId, destination, fare } = {}) => {
+        try {
+          const driver = onlineDrivers.get(preferredDriverId);
+
+          // Mencari data customer yang lebih akurat berdasarkan ID, bukan cuma socket
+          const customerSnapshot = Array.from(onlineCustomers.values()).find(
+            (c) => {
+              console.log("CUSTOMER DATA LOG:  " + JSON.stringify(c));
+              const metaId = c?.meta?.id ?? c?.meta?.customerId;
+              return metaId != null && String(metaId) === String(customerId);
+            },
+          );
+
+          if (!driver || driver.status !== "online") {
+            return socket.emit("ride:booked", {
+              ok: false,
+              reason: "driver_unavailable",
+            });
+          }
+
+          // Lock driver
+          const lockedDriver = { ...driver, status: "booked" };
+          onlineDrivers.set(preferredDriverId, lockedDriver);
+
+          // Siapkan Profile Payload secara lengkap
+
+          let customerLocation = customerSnapshot?.meta?.lastCoords ?? null;
+          if (!customerLocation) customerLocation = location_if_needed; 
+
+          // Simpan ke memory rides
+          rides.set(rideId, {
+            rideId,
+            driverId: preferredDriverId,
+            status: "booked",
+            destination: destination || null,
+            customerLocation,
+            driver: lockedDriver,
+            customer: { id: customerId, ...customerSnapshot } || null, // Simpan profil di objek ride agar awet
+          });
+
+          // BUNGKUS SEMUA DATA DALAM SATU EMIT
+          const fullPayload = {
+            rideId,
+            status: "booked",
+            driver: lockedDriver,
+            destination: destination || null,
+            customerLocation,
+            customer: { id: customerId, ...customerSnapshot } || null, // Driver langsung dapet data customer di sini
+          };
+
+          // Join room
+          socket.join(rideId);
+          const driverSocket = io.sockets.sockets.get(driver.socketId);
+          if (driverSocket) driverSocket.join(rideId);
+
+          // EMIT UTAMA: Ke seluruh room
+          io.to(rideId).emit("ride:status", fullPayload);
+
+          // FALLBACK EMIT: Langsung ke socket driver (antisipasi gagal join room)
+          if (driver.socketId) {
+            io.to(driver.socketId).emit("ride:status", {
+              ...fullPayload,
+              _fallback: true,
+            });
+          }
+
+          // Konfirmasi ke pengirim (Customer)
+          socket.emit("ride:booked", {
+            ok: true,
+            rideId,
+            driver: lockedDriver,
+          });
+          emitDriverList();
+        } catch (e) {
+          log("ride:book error", e.message);
+          socket.emit("ride:booked", { ok: false, reason: "internal_error" });
+        }
+      },
+    );
+
+    // ride:ongoing - driver (or server) signals ride moved to ongoing
+    socket.on("ride:ongoing", (payload, ack) => {
+      try {
+        const { rideId } = payload || {};
+        log("ride:ongoing received", { rideId, fromSocket: socket.id });
+        const r = rides.get(rideId);
+        if (!r) {
+          log("ride:ongoing - ride not found", { rideId });
+          if (typeof ack === "function")
+            ack({ ok: false, reason: "ride_not_found" });
+          return;
+        }
+
+        r.status = "ongoing";
+        rides.set(rideId, r);
+
+        const driverEntry = onlineDrivers.get(r.driverId);
+        if (driverEntry) {
+          onlineDrivers.set(r.driverId, { ...driverEntry, status: "booked" });
+          emitDriverList();
+        }
+
+        io.to(rideId).emit("ride:status", {
+          rideId,
+          status: "ongoing",
+          driverId: r.driverId,
+          destination: r.destination || null,
+        });
+
+        log("ride:ongoing processed", { rideId, driverId: r.driverId });
+        if (typeof ack === "function") ack({ ok: true, rideId });
+      } catch (e) {
+        log("ride:ongoing error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // ride cancel (existing)
+    socket.on("ride:cancel", (payload, ack) => {
+      try {
+        const { rideId } = payload || {};
+        log("ride:cancel received", { rideId });
+        const r = rides.get(rideId);
+        if (r) {
+          const driver = onlineDrivers.get(r.driverId);
+          if (driver) {
+            onlineDrivers.set(r.driverId, { ...driver, status: "online" });
+            log("ride:cancel - driver unlocked", { driverId: r.driverId });
+          }
+          rides.delete(rideId);
+          log("ride:cancel - ride removed", { rideId, totalRides: rides.size });
+
+          io.to(rideId).emit("ride:status", {
+            rideId,
+            status: "canceled",
+            driverId: r.driverId,
+          });
+
+          emitDriverList();
+
+          if (typeof ack === "function") ack({ ok: true });
+        } else {
+          log("ride:cancel - ride not found", { rideId });
+          if (typeof ack === "function")
+            ack({ ok: false, reason: "ride_not_found" });
+        }
+      } catch (e) {
+        log("ride:cancel error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // ride arrived (existing)
+    socket.on("ride:arrived", (payload, ack) => {
+      try {
+        const { rideId } = payload || {};
+        log("ride:arrived received", { rideId, fromSocket: socket.id });
+        const r = rides.get(rideId);
+        if (!r) {
+          log("ride:arrived - ride not found", { rideId });
+          if (typeof ack === "function")
+            ack({ ok: false, reason: "ride_not_found" });
+          return;
+        }
+
+        r.status = "arrived";
+        rides.set(rideId, r);
+
+        io.to(rideId).emit("ride:status", {
+          rideId,
+          status: "arrived",
+          driverId: r.driverId,
+          destination: r.destination || null,
+        });
+
+        log("ride:arrived processed", { rideId, driverId: r.driverId });
+        if (typeof ack === "function") ack({ ok: true, rideId });
+      } catch (e) {
+        log("ride:arrived error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // ride complete (existing)
+    socket.on("ride:complete", (payload, ack) => {
+      try {
+        const { rideId } = payload || {};
+        log("ride:complete received", { rideId, fromSocket: socket.id });
+        const r = rides.get(rideId);
+        if (!r) {
+          log("ride:complete - ride not found", { rideId });
+          if (typeof ack === "function")
+            ack({ ok: false, reason: "ride_not_found" });
+          return;
+        }
+
+        r.status = "completed";
+        rides.set(rideId, r);
+
+        const driver = onlineDrivers.get(r.driverId);
+        if (driver) {
+          onlineDrivers.set(r.driverId, { ...driver, status: "online" });
+          emitDriverList();
+        }
+
+        io.to(rideId).emit("ride:status", {
+          rideId,
+          status: "completed",
+          driverId: r.driverId,
+        });
+
+        rides.delete(rideId);
+        log("ride:complete processed and removed", { rideId });
+
+        if (typeof ack === "function") ack({ ok: true, rideId });
+      } catch (e) {
+        log("ride:complete error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // join ride room (existing)
+    socket.on("join:ride", (rideId) => {
+      try {
+        socket.join(rideId);
+        log("join:ride", { socketId: socket.id, rideId });
+      } catch (e) {
+        log("join:ride error", e?.message ?? e);
+      }
+    });
+
+    // debug: return current state snapshot (existing)
+    socket.on("debug:state", () => {
+      try {
+        log("debug:state requested", { socketId: socket.id });
+        socket.emit("debug:state:response", {
+          onlineDrivers: Array.from(onlineDrivers.values()),
+          rides: Array.from(rides.values()),
+          onlineCustomers: Array.from(onlineCustomers.values()),
+          userSockets: Array.from(userSockets.entries()).map(([u, s]) => [
+            u,
+            Array.from(s),
+          ]),
+          messagesCount: Array.from(messages.entries()).map(([r, list]) => ({
+            roomId: r,
+            count: list.length,
+          })),
+        });
+      } catch (e) {
+        log("debug:state error", e?.message ?? e);
+      }
+    });
+
+    // debug: counts (drivers/customers) (existing)
+    socket.on("debug:counts", (payload, ack) => {
+      try {
+        const driverCount = onlineDrivers.size;
+        const customerCount = onlineCustomers.size;
+        const result = {
+          drivers: driverCount,
+          customers: customerCount,
+          users: userSockets.size,
+        };
+
+        log("debug:counts requested", { socketId: socket.id, result });
+
+        socket.emit("debug:counts:response", result);
+        if (typeof ack === "function") ack({ ok: true, ...result });
+      } catch (e) {
+        log("debug:counts error", e?.message ?? e);
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // optional: echo ride:status for quick client-side testing (remove in production)
+    socket.on("__debug_echo_ride_status", (payload) => {
+      try {
+        log("__debug_echo_ride_status received", {
+          socketId: socket.id,
+          payload,
+        });
+        socket.emit("ride:status", { echoed: true, original: payload });
+      } catch (e) {
+        log("__debug_echo_ride_status error", e?.message ?? e);
+      }
+    });
+
+    // disconnect handling (existing) - enhanced to cleanup userSockets
+    socket.on("disconnect", () => {
+      try {
+        log("disconnect", { socketId: socket.id, userId: socket.userId });
+
+        // cleanup chat mapping if present
+        if (socket.userId) {
+          unregisterSocketForUser(String(socket.userId), socket.id);
+        } else {
+          // Failsafe: Jika socket.userId hilang, cari manual di semua Set
+          for (const [uid, set] of userSockets.entries()) {
+            if (set.has(socket.id)) {
+              unregisterSocketForUser(uid, socket.id);
+            }
+          }
+        }
+
+        // remove from onlineCustomers if present
+        if (onlineCustomers.has(socket.id)) {
+          onlineCustomers.delete(socket.id);
+          log("customer disconnected and removed", {
+            socketId: socket.id,
+            totalCustomers: onlineCustomers.size,
+          });
+        }
+
+        // cek apakah socket ini bagian dari ride
+        const activeRide = [...rides.values()].find(
+          (r) =>
+            r.driverSocketId === socket.id || r.customerSocketId === socket.id,
+        );
+
+        if (activeRide) {
+          console.log("CLEANUP ZOMBIE RIDE", activeRide.rideId);
+
+          rides.delete(activeRide.rideId);
+
+          io.to(activeRide.rideId).emit("ride:status", {
+            rideId: activeRide.rideId,
+            status: "canceled",
+            reason: "peer_disconnected",
+          });
+        }
+
+        const driverId = socketIdToDriverId.get(socket.id);
+        if (driverId) {
+          // if driver was booked on a ride, remove ride and notify room
+          const activeRide = Array.from(rides.values()).find(
+            (r) => r.driverId === driverId,
+          );
+          if (activeRide) {
+            rides.delete(activeRide.rideId);
+            log("driver disconnected while booked - ride removed", {
+              rideId: activeRide.rideId,
+              driverId,
+            });
+            io.to(activeRide.rideId).emit("ride:status", {
+              rideId: activeRide.rideId,
+              status: "canceled",
+              reason: "driver_disconnected",
+            });
+          }
+
+          // remove driver from online list and reverse map
+          onlineDrivers.delete(driverId);
+          socketIdToDriverId.delete(socket.id);
+
+          // also cleanup chat mapping
+          unregisterSocketForUser(String(driverId), socket.id);
+
+          log("driver disconnected and removed", {
+            driverId,
+            socketId: socket.id,
+            totalOnlineDrivers: onlineDrivers.size,
+          });
+
+          // broadcast updated driver list
+          emitDriverList();
+        } else {
+          // fallback: scan onlineDrivers if mapping missing
+          for (const [id, d] of Array.from(onlineDrivers.entries())) {
+            if (d.socketId === socket.id) {
+              const activeRide = Array.from(rides.values()).find(
+                (r) => r.driverId === id,
+              );
+              if (activeRide) {
+                rides.delete(activeRide.rideId);
+                log(
+                  "driver disconnected while booked - ride removed (fallback)",
+                  {
+                    rideId: activeRide.rideId,
+                    driverId: id,
+                  },
+                );
+                io.to(activeRide.rideId).emit("ride:status", {
+                  rideId: activeRide.rideId,
+                  status: "canceled",
+                  reason: "driver_disconnected",
+                });
+              }
+
+              onlineDrivers.delete(id);
+              socketIdToDriverId.delete(socket.id);
+              unregisterSocketForUser(String(id), socket.id);
+
+              log("driver disconnected and removed (fallback)",             {   driverId: id,
+                socketId: socket.id,
+                totalOnlineDrivers: onlineDrivers.size,
+              });
+              emitDriverList();
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        log("disconnect handler error", e?.message ?? e);
+      }
+    });
+  });
+};
