@@ -1131,6 +1131,40 @@ module.exports = (io) => {
       }
     });
 
+    // Pembatalan fase pra-perjalanan QR (driver tekan batal ATAU customer batal).
+    // Beritahu pihak lain, lalu RESET sesi ke "free" supaya QR driver siap lagi.
+    socket.on("qr:cancel", ({ rideId, by } = {}, ack) => {
+      try {
+        if (!rideId) return ack?.({ ok: false, reason: "invalid_payload" });
+        const entry = qrRides.get(rideId);
+
+        socket.to(rideId).emit("qr:status", {
+          rideId,
+          status: "canceled",
+          by: by ?? null,
+          reason: "canceled",
+        });
+
+        if (entry && entry.status !== "completed") {
+          qrRides.set(rideId, {
+            ...entry,
+            status: "free",
+            customerId: null,
+            customer: null,
+            destination: null,
+            customerLocation: null,
+            updatedAt: now(),
+          });
+        }
+
+        log("qr:cancel", { rideId, by });
+        ack?.({ ok: true, rideId });
+      } catch (e) {
+        log("qr:cancel error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
     // Lokasi selama perjalanan QR: track di backend (qrRide + lastSeen) + relay.
     socket.on("qr:location", ({ rideId, role, id, coords } = {}) => {
       try {
@@ -1278,19 +1312,55 @@ module.exports = (io) => {
           });
         }
 
-        // --- Bersihkan perjalanan QR yang melibatkan socket ini ---
+        // --- Cleanup perjalanan QR saat disconnect ---
         if (socket.userId) {
           const uid = String(socket.userId);
           for (const [rId, qr] of Array.from(qrRides.entries())) {
             const isDriver = String(qr.driverId) === uid;
             const isCustomer = qr.customerId && String(qr.customerId) === uid;
             if (!isDriver && !isCustomer) continue;
-            socket.to(rId).emit("qr:status", {
-              rideId: rId,
-              status: "canceled",
-              reason: "peer_disconnected",
-            });
-            if (qr.status !== "completed") qrRides.delete(rId);
+
+            const inJourney = qr.status === "active";
+
+            if (isDriver) {
+              // DRIVER putus -> perjalanan otomatis BERAKHIR; beri tahu penumpang.
+              socket.to(rId).emit("qr:status", {
+                rideId: rId,
+                status: "canceled",
+                by: "driver",
+                reason: "peer_disconnected",
+              });
+              if (qr.status !== "completed") qrRides.delete(rId);
+            } else if (isCustomer) {
+              if (inJourney) {
+                // PENUMPANG putus SAAT PERJALANAN -> JANGAN akhiri perjalanan.
+                // Driver tetap lanjut & lihat maps; data terakhir penumpang
+                // (customerLocation) sudah tersimpan di qrRide. Tandai offline saja.
+                qrRides.set(rId, {
+                  ...qr,
+                  customerOnline: false,
+                  updatedAt: now(),
+                });
+              } else if (qr.status !== "completed") {
+                // Penumpang keluar saat PRA-perjalanan -> reset sesi ke "free"
+                // supaya QR driver kembali siap menerima penumpang baru.
+                socket.to(rId).emit("qr:status", {
+                  rideId: rId,
+                  status: "canceled",
+                  by: "customer",
+                  reason: "peer_disconnected",
+                });
+                qrRides.set(rId, {
+                  ...qr,
+                  status: "free",
+                  customerId: null,
+                  customer: null,
+                  destination: null,
+                  customerLocation: null,
+                  updatedAt: now(),
+                });
+              }
+            }
           }
         }
 
@@ -1315,23 +1385,13 @@ module.exports = (io) => {
           });
         }
 
-        // cek apakah socket ini bagian dari ride
-        const activeRide = [...rides.values()].find(
-          (r) =>
-            r.driverSocketId === socket.id || r.customerSocketId === socket.id,
-        );
-
-        if (activeRide) {
-          console.log("CLEANUP ZOMBIE RIDE", activeRide.rideId);
-
-          rides.delete(activeRide.rideId);
-
-          io.to(activeRide.rideId).emit("ride:status", {
-            rideId: activeRide.rideId,
-            status: "canceled",
-            reason: "peer_disconnected",
-          });
-        }
+        // ATURAN: penumpang (customer) yang terputus TIDAK mengakhiri perjalanan
+        // — driver harus tetap melihat maps & lanjut dengan data terakhir.
+        // Hanya DRIVER yang terputus yang mengakhiri ride (di-handle juga oleh
+        // blok socketIdToDriverId di bawah). Jadi cek di sini KHUSUS driver.
+        // (tidak ada aksi cancel di sini — dihapus untuk menghindari emit ganda
+        // dengan blok socketIdToDriverId, yang bisa men-trigger rating/komentar
+        // pembatalan 2x di sisi customer.)
 
         const driverId = socketIdToDriverId.get(socket.id);
         if (driverId) {
