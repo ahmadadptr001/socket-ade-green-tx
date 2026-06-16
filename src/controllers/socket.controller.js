@@ -20,6 +20,21 @@ const activeCalls = new Map();
 //   createdAt
 // }
 
+// QR-CODE RIDE addition: state perjalanan QR ditrack di backend (bukan relay buta)
+const qrRides = new Map();
+// rideId -> {
+//   rideId, driverId, driver(profile), customerId, customer(profile),
+//   status: 'free' | 'waiting_customer' | 'active' | 'completed',
+//   driverLocation, customerLocation, destination,
+//   originText, destinationText, fare, distance, duration,
+//   createdAt, updatedAt
+// }
+
+// PRESENCE addition: lokasi terakhir tiap driver, TETAP tersimpan walau driver
+// disconnect (online:false). Untuk fitur "driver tidak terhubung + lokasi terakhir".
+const driverLastSeen = new Map();
+// driverId -> { driverId, coords, online, socketId, car, lastSeen }
+
 function now() {
   return new Date().toISOString();
 }
@@ -78,6 +93,34 @@ module.exports = (io) => {
     const lng = Number(coords.lng ?? coords.longitude ?? coords.long ?? NaN);
     if (!isFinite(lat) || !isFinite(lng)) return null;
     return { lat, lng };
+  }
+
+  // Catat lokasi/presence driver. Disimpan walau driver disconnect (online:false)
+  // sehingga lokasi terakhir driver yang tidak terhubung tetap bisa dibaca.
+  function updateDriverLastSeen(driverId, coords, extra = {}) {
+    if (driverId == null) return;
+    const id = String(driverId);
+    const prev = driverLastSeen.get(id) || {};
+    const c = coords ? normalizeCoords(coords) : null;
+    driverLastSeen.set(id, {
+      driverId: id,
+      coords: c || prev.coords || null,
+      online: extra.online != null ? extra.online : prev.online ?? true,
+      socketId: extra.socketId ?? prev.socketId ?? null,
+      car: extra.car ?? prev.car ?? null,
+      lastSeen: now(),
+    });
+  }
+
+  // Tandai driver offline tapi PERTAHANKAN lokasi terakhirnya.
+  function markDriverOffline(driverId) {
+    if (driverId == null) return null;
+    const id = String(driverId);
+    const prev = driverLastSeen.get(id);
+    if (!prev) return null;
+    const updated = { ...prev, online: false, socketId: null, lastSeen: now() };
+    driverLastSeen.set(id, updated);
+    return updated;
   }
 
   // --- CHAT helper functions ---
@@ -403,6 +446,11 @@ module.exports = (io) => {
         };
         onlineDrivers.set(id, entry);
         socketIdToDriverId.set(socket.id, id);
+        updateDriverLastSeen(id, entry.coords, {
+          online: true,
+          socketId: socket.id,
+          car: car || null,
+        });
 
         // register mapping for chat
         if (id) {
@@ -433,6 +481,17 @@ module.exports = (io) => {
         // unregister from userSockets
         if (id) unregisterSocketForUser(String(id), socket.id);
 
+        // Tandai offline tapi simpan lokasi terakhir + beritahu pemantau.
+        const last = markDriverOffline(id);
+        if (id) {
+          io.emit("driver:disconnected", {
+            driverId: String(id),
+            reason: "offline",
+            coords: last?.coords ?? null,
+            lastSeen: last?.lastSeen ?? now(),
+          });
+        }
+
         log("driver:offline", {
           driverId: id,
           removed,
@@ -448,6 +507,14 @@ module.exports = (io) => {
     socket.on("driver:location", ({ rideId, id, coords } = {}) => {
       try {
         const normalized = normalizeCoords(coords);
+        // Selalu catat lokasi terakhir driver (termasuk driver mode QR yang
+        // tidak ada di onlineDrivers) supaya presence/last-location akurat.
+        if (id != null && normalized) {
+          updateDriverLastSeen(id, normalized, {
+            online: true,
+            socketId: socket.id,
+          });
+        }
         const d = onlineDrivers.get(id);
         if (d) {
           const updated = {
@@ -947,19 +1014,165 @@ module.exports = (io) => {
       }
     });
 
-    // QR-code ride: relay sinyal status antar perangkat lewat room (ringan,
-    // tanpa state). Menggantikan Supabase Realtime yang lambat & berat saat
-    // pengguna banyak. Payload diteruskan apa adanya ke anggota room lain.
+    // ===========================================================
+    // QR-CODE RIDE — di-track di backend, signaling via socket (bukan Supabase).
+    // Room = rideId (= "ride-" + driverId).
+    // ===========================================================
+
+    // Driver buka layar QR: umumkan ketersediaan + simpan profil utk handshake.
+    socket.on("qr:driver:ready", ({ driverId, coords, car } = {}, ack) => {
+      try {
+        if (!driverId) return ack?.({ ok: false, reason: "invalid_payload" });
+        const rideId = `ride-${driverId}`;
+        socket.userId = String(driverId);
+        registerSocketForUser(String(driverId), socket.id);
+        socket.join(rideId);
+
+        const prev = qrRides.get(rideId) || {};
+        qrRides.set(rideId, {
+          ...prev,
+          rideId,
+          driverId: String(driverId),
+          driver: car ?? prev.driver ?? null,
+          status: "free",
+          createdAt: prev.createdAt ?? now(),
+          updatedAt: now(),
+        });
+        updateDriverLastSeen(driverId, coords, {
+          online: true,
+          socketId: socket.id,
+          car: car ?? null,
+        });
+
+        log("qr:driver:ready", { rideId });
+        ack?.({ ok: true, rideId });
+      } catch (e) {
+        log("qr:driver:ready error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Customer scan QR driver: klaim sesi TANPA Supabase. Balas rideId + profil driver.
+    socket.on("qr:scan", ({ driverId, customer } = {}, ack) => {
+      try {
+        if (!driverId) return ack?.({ ok: false, reason: "invalid_payload" });
+        const rideId = `ride-${driverId}`;
+        const entry = qrRides.get(rideId);
+
+        if (!entry) return ack?.({ ok: false, reason: "driver_unavailable" });
+        if (entry.status !== "free")
+          return ack?.({ ok: false, reason: "expired" });
+
+        const customerId = customer?.id ?? null;
+        qrRides.set(rideId, {
+          ...entry,
+          customerId: customerId != null ? String(customerId) : null,
+          customer: customer ?? null,
+          status: "waiting_customer",
+          updatedAt: now(),
+        });
+        if (customerId != null) {
+          socket.userId = String(customerId);
+          registerSocketForUser(String(customerId), socket.id);
+        }
+        socket.join(rideId);
+
+        // Beritahu driver: penumpang sedang menentukan rute.
+        socket.to(rideId).emit("qr:status", {
+          rideId,
+          status: "waiting_customer",
+        });
+
+        log("qr:scan claimed", { rideId, customerId });
+        ack?.({ ok: true, rideId, driver: entry.driver ?? null });
+      } catch (e) {
+        log("qr:scan error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Update status QR (active/completed/dll) -> simpan state + relay ke room.
     socket.on("qr:status", (payload = {}, ack) => {
       try {
         const rideId = payload?.rideId;
+        const status = payload?.status;
         if (!rideId) return ack?.({ ok: false, reason: "invalid_payload" });
+
+        const prev = qrRides.get(rideId) || { rideId, createdAt: now() };
+        const entry = {
+          ...prev,
+          rideId,
+          status: status ?? prev.status,
+          driverId: payload.driver_id ?? prev.driverId ?? null,
+          customerId: payload.customer?.id ?? prev.customerId ?? null,
+          driver: payload.driver ?? prev.driver ?? null,
+          customer: payload.customer ?? prev.customer ?? null,
+          destination: payload.posDestination ?? prev.destination ?? null,
+          customerLocation:
+            payload.posCustomer ?? prev.customerLocation ?? null,
+          originText: payload.originText ?? prev.originText ?? null,
+          destinationText:
+            payload.destinationText ?? prev.destinationText ?? null,
+          fare: payload.fare ?? prev.fare ?? null,
+          distance: payload.distance ?? prev.distance ?? null,
+          duration: payload.duration ?? prev.duration ?? null,
+          updatedAt: now(),
+        };
+
+        if (status === "completed") qrRides.delete(rideId);
+        else qrRides.set(rideId, entry);
+
         socket.to(rideId).emit("qr:status", payload);
-        log("qr:status relayed", { rideId, status: payload?.status });
-        ack?.({ ok: true });
+        log("qr:status", { rideId, status });
+        ack?.({ ok: true, rideId });
       } catch (e) {
         log("qr:status error", e?.message ?? e);
         ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Lokasi selama perjalanan QR: track di backend (qrRide + lastSeen) + relay.
+    socket.on("qr:location", ({ rideId, role, id, coords } = {}) => {
+      try {
+        const normalized = normalizeCoords(coords);
+        if (!rideId || !normalized) return;
+        const entry = qrRides.get(rideId);
+        if (entry) {
+          if (role === "driver") entry.driverLocation = normalized;
+          else if (role === "customer") entry.customerLocation = normalized;
+          entry.updatedAt = now();
+          qrRides.set(rideId, entry);
+        }
+        if (role === "driver" && id != null) {
+          updateDriverLastSeen(id, normalized, {
+            online: true,
+            socketId: socket.id,
+          });
+        }
+        socket.to(rideId).emit("location:update", {
+          role,
+          id,
+          coords: normalized,
+          rideId,
+        });
+      } catch (e) {
+        log("qr:location error", e?.message ?? e);
+      }
+    });
+
+    // Query: lokasi terakhir semua driver (online & offline) utk pemantauan.
+    socket.on("drivers:lastseen", (payload, ack) => {
+      try {
+        const list = Array.from(driverLastSeen.values());
+        if (typeof ack === "function") ack({ ok: true, drivers: list });
+        else
+          socket.emit("drivers:lastseen:response", {
+            ok: true,
+            drivers: list,
+          });
+      } catch (e) {
+        log("drivers:lastseen error", e?.message ?? e);
+        if (typeof ack === "function") ack({ ok: false });
       }
     });
 
@@ -979,6 +1192,8 @@ module.exports = (io) => {
             roomId: r,
             count: list.length,
           })),
+          qrRides: Array.from(qrRides.values()),
+          driverLastSeen: Array.from(driverLastSeen.values()),
         });
       } catch (e) {
         log("debug:state error", e?.message ?? e);
@@ -1043,6 +1258,39 @@ module.exports = (io) => {
               });
             });
             activeCalls.delete(cId);
+          }
+        }
+
+        // --- Presence driver: tandai offline, simpan lokasi terakhir, notify ---
+        // Termasuk driver mode QR (tidak ada di socketIdToDriverId, dikenali via userId).
+        const discDriverId =
+          socketIdToDriverId.get(socket.id) ??
+          (socket.userId && driverLastSeen.has(String(socket.userId))
+            ? String(socket.userId)
+            : null);
+        if (discDriverId) {
+          const last = markDriverOffline(discDriverId);
+          io.emit("driver:disconnected", {
+            driverId: String(discDriverId),
+            reason: "disconnected",
+            coords: last?.coords ?? null,
+            lastSeen: last?.lastSeen ?? now(),
+          });
+        }
+
+        // --- Bersihkan perjalanan QR yang melibatkan socket ini ---
+        if (socket.userId) {
+          const uid = String(socket.userId);
+          for (const [rId, qr] of Array.from(qrRides.entries())) {
+            const isDriver = String(qr.driverId) === uid;
+            const isCustomer = qr.customerId && String(qr.customerId) === uid;
+            if (!isDriver && !isCustomer) continue;
+            socket.to(rId).emit("qr:status", {
+              rideId: rId,
+              status: "canceled",
+              reason: "peer_disconnected",
+            });
+            if (qr.status !== "completed") qrRides.delete(rId);
           }
         }
 

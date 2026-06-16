@@ -3,13 +3,26 @@ const nodemailer = require("nodemailer");
 const bcrypt = require("bcryptjs");
 
 exports.sendNotification = async (req, res) => {
-  const message = req.body;
+  const raw = req.body;
+
+  // Pastikan tiap pesan punya sound + heads-up (priority/channelId) supaya di HP
+  // BERBUNYI dan MUNCUL di atas layar. Nilai dari caller tetap diprioritaskan.
+  const withDefaults = (m = {}) => ({
+    ...m,
+    sound: m.sound ?? "default",
+    priority: m.priority ?? "high",
+    channelId: m.channelId ?? "default",
+  });
+  const message = Array.isArray(raw)
+    ? raw.map(withDefaults)
+    : withDefaults(raw);
 
   try {
     const response = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
       headers: {
         Accept: "application/json",
+        "Accept-encoding": "gzip, deflate",
         "Content-Type": "application/json",
       },
       body: JSON.stringify(message),
