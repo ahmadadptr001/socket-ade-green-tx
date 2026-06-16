@@ -43,13 +43,32 @@ setInterval(() => {
 }, 10 * 1000);
 
 module.exports = (io) => {
-  // helper: broadcast daftar driver ke semua client
-  function emitDriverList() {
+  // helper: broadcast daftar driver ke semua client.
+  // DI-THROTTLE (leading + trailing, maks 1x / 1.5s) supaya saat banyak driver
+  // online, burst "driver:location" tidak memicu io.emit beruntun ke SEMUA
+  // client (mencegah flood O(driver x client) saat pengguna membludak).
+  let _driverListTimer = null;
+  let _driverListPending = false;
+  function _emitDriverListNow() {
     try {
       io.emit("driver:list", Array.from(onlineDrivers.values()));
     } catch (e) {
       log("emitDriverList error", e?.message ?? e);
     }
+  }
+  function emitDriverList() {
+    if (_driverListTimer) {
+      _driverListPending = true;
+      return;
+    }
+    _emitDriverListNow();
+    _driverListTimer = setTimeout(() => {
+      _driverListTimer = null;
+      if (_driverListPending) {
+        _driverListPending = false;
+        emitDriverList();
+      }
+    }, 1500);
   }
 
   // normalize coords helper
@@ -251,6 +270,37 @@ module.exports = (io) => {
         ack?.({ ok: false });
       }
     });
+
+    // CALLER CANCELS (saat masih ringing) atau TIMEOUT (tak diangkat)
+    // -> beri tahu kedua pihak agar UI panggilan tertutup, lalu bersihkan.
+    const cancelCall = ({ callId } = {}, ack, reason) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) return ack?.({ ok: false, reason: "call_not_found" });
+
+        const targets = [
+          ...getSocketIdsForUser(String(call.fromUserId)),
+          ...getSocketIdsForUser(String(call.toUserId)),
+        ];
+        targets.forEach((sid) => {
+          io.to(sid).emit("call:canceled", { callId, reason });
+        });
+
+        activeCalls.delete(callId);
+        log("call canceled", { callId, reason });
+        ack?.({ ok: true });
+      } catch (e) {
+        log("call:cancel error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    };
+
+    socket.on("call:cancel", (payload, ack) =>
+      cancelCall(payload, ack, "canceled"),
+    );
+    socket.on("call:timeout", (payload, ack) =>
+      cancelCall(payload, ack, "timeout"),
+    );
 
     // --- CHAT: optional explicit register (client can emit after connect) ---
     socket.on("chat:register", ({ userId, role }, ack) => {
@@ -670,7 +720,6 @@ module.exports = (io) => {
           // Mencari data customer yang lebih akurat berdasarkan ID, bukan cuma socket
           const customerSnapshot = Array.from(onlineCustomers.values()).find(
             (c) => {
-              console.log("CUSTOMER DATA LOG:  " + JSON.stringify(c));
               const metaId = c?.meta?.id ?? c?.meta?.customerId;
               return metaId != null && String(metaId) === String(customerId);
             },
@@ -898,6 +947,22 @@ module.exports = (io) => {
       }
     });
 
+    // QR-code ride: relay sinyal status antar perangkat lewat room (ringan,
+    // tanpa state). Menggantikan Supabase Realtime yang lambat & berat saat
+    // pengguna banyak. Payload diteruskan apa adanya ke anggota room lain.
+    socket.on("qr:status", (payload = {}, ack) => {
+      try {
+        const rideId = payload?.rideId;
+        if (!rideId) return ack?.({ ok: false, reason: "invalid_payload" });
+        socket.to(rideId).emit("qr:status", payload);
+        log("qr:status relayed", { rideId, status: payload?.status });
+        ack?.({ ok: true });
+      } catch (e) {
+        log("qr:status error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
     // debug: return current state snapshot (existing)
     socket.on("debug:state", () => {
       try {
@@ -959,6 +1024,27 @@ module.exports = (io) => {
     socket.on("disconnect", () => {
       try {
         log("disconnect", { socketId: socket.id, userId: socket.userId });
+
+        // akhiri panggilan aktif yang melibatkan user ini (cegah call zombie)
+        if (socket.userId) {
+          for (const [cId, call] of Array.from(activeCalls.entries())) {
+            const isParty =
+              String(call.fromUserId) === String(socket.userId) ||
+              String(call.toUserId) === String(socket.userId);
+            if (!isParty) continue;
+            const other =
+              String(call.fromUserId) === String(socket.userId)
+                ? call.toUserId
+                : call.fromUserId;
+            getSocketIdsForUser(String(other)).forEach((sid) => {
+              io.to(sid).emit("call:ended", {
+                callId: cId,
+                reason: "peer_disconnected",
+              });
+            });
+            activeCalls.delete(cId);
+          }
+        }
 
         // cleanup chat mapping if present
         if (socket.userId) {

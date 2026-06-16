@@ -1,16 +1,16 @@
-const supabase = require('../configs/supabase.config');
-const nodemailer = require('nodemailer');
-const bcrypt = require('bcryptjs');
+const supabase = require("../configs/supabase.config");
+const nodemailer = require("nodemailer");
+const bcrypt = require("bcryptjs");
 
 exports.sendNotification = async (req, res) => {
   const message = req.body;
 
   try {
-    const response = await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
+    const response = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
       headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
+        Accept: "application/json",
+        "Content-Type": "application/json",
       },
       body: JSON.stringify(message),
     });
@@ -18,7 +18,7 @@ exports.sendNotification = async (req, res) => {
     const result = await response.json();
 
     // Expo balas error
-    if (result?.data?.status === 'error') {
+    if (result?.data?.status === "error") {
       return res.status(400).json({
         status: 400,
         message: result.data.message,
@@ -29,11 +29,11 @@ exports.sendNotification = async (req, res) => {
     // Berhasil
     return res.json({
       status: 200,
-      message: 'Notifikasi terkirim',
+      message: "Notifikasi terkirim",
       expoResponse: result,
     });
   } catch (err) {
-    console.error('ERROR LOG NOTIFICATION:', err);
+    console.error("ERROR LOG NOTIFICATION:", err);
 
     return res.status(500).json({
       status: 500,
@@ -48,10 +48,10 @@ exports.sendOTP = async (req, res) => {
 
     const now = new Date().toISOString();
     const { data: recentOtp } = await supabase
-      .from('otps')
-      .select('created_at')
-      .eq('email', email)
-      .order('created_at', { ascending: false })
+      .from("otps")
+      .select("created_at")
+      .eq("email", email)
+      .order("created_at", { ascending: false })
       .limit(1)
       .single();
     if (
@@ -60,7 +60,7 @@ exports.sendOTP = async (req, res) => {
     ) {
       return res.status(429).json({
         status: 429,
-        message: 'Tunggu sebentar sebelum meminta OTP lagi.',
+        message: "Tunggu sebentar sebelum meminta OTP lagi.",
       });
     }
 
@@ -68,7 +68,7 @@ exports.sendOTP = async (req, res) => {
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 menit
 
     const { data, error } = await supabase
-      .from('otps')
+      .from("otps")
       .insert([{ email, code: otp, expires_at: expiresAt }]);
 
     if (error) {
@@ -76,19 +76,19 @@ exports.sendOTP = async (req, res) => {
     }
 
     const transporter = nodemailer.createTransport({
-      host: 'smtp.hostinger.com',
+      host: "smtp.hostinger.com",
       port: 465,
       secure: true,
       auth: {
         user: process.env.SMTP_EMAIL,
-        pass: process.env.SMTP_PASSWORD',
+        pass: process.env.SMTP_PASSWORD,
       },
     });
 
     await transporter.sendMail({
       from: '"Ade Green TX" support@adegreentx.id',
       to: email,
-      subject: 'Kode OTP Anda',
+      subject: "Kode OTP Anda",
       html: `
       <div style="max-width: 700px; margin: auto; font-family: 'Segoe UI', sans-serif; background-color: #ffffff; padding: 40px; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.1);">
         <div style="text-align: center;">
@@ -117,7 +117,7 @@ exports.sendOTP = async (req, res) => {
 
     res.json({
       status: 200,
-      message: 'Kode otp berhasil terkirim ke ' + email,
+      message: "Kode otp berhasil terkirim ke " + email,
     });
   } catch (e) {
     res.json({
@@ -127,7 +127,7 @@ exports.sendOTP = async (req, res) => {
   }
 };
 
-exports.getHalo = (req, res) => res.json({ message: 'halo' });
+exports.getHalo = (req, res) => res.json({ message: "halo" });
 
 exports.hashPassword = async (req, res) => {
   try {
@@ -136,7 +136,7 @@ exports.hashPassword = async (req, res) => {
     const pwHash = bcrypt.hashSync(password, salt);
     res.json({
       status: 200,
-      meessage: 'Berhasil melakukan hash password',
+      meessage: "Berhasil melakukan hash password",
       hashPassword: pwHash,
     });
   } catch (e) {
