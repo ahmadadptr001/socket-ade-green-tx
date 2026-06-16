@@ -763,17 +763,34 @@ module.exports = (io) => {
         r.status = "accepted"; // Ubah status dari booked ke accepted
         rides.set(rideId, r);
 
-        // Beritahu PENUMPANG bahwa driver sudah fiks menerima
+        // Beritahu PENUMPANG + bawa data lengkap (lokasi/tujuan/profil) supaya
+        // layar perjalanan driver TIDAK perlu menunggu snapshot lambat.
         io.to(rideId).emit("ride:status", {
           rideId,
           status: "accepted",
           driverId: r.driverId,
+          driver: r.driver ?? null,
+          destination: r.destination ?? null,
+          customerLocation: r.customerLocation ?? null,
+          customer: r.customer ?? null,
         });
 
         log("ride:accepted by driver", { rideId, driverId: r.driverId });
         ack?.({ ok: true });
       } catch (e) {
         ack?.({ ok: false });
+      }
+    });
+
+    // Ambil snapshot 1 ride dengan cepat (pengganti debug:state yang berat),
+    // dipakai layar perjalanan driver untuk init data customer secepatnya.
+    socket.on("ride:get", ({ rideId } = {}, ack) => {
+      try {
+        const r = rideId ? rides.get(rideId) : null;
+        if (typeof ack === "function") ack({ ok: !!r, ride: r ?? null });
+      } catch (e) {
+        log("ride:get error", e?.message ?? e);
+        if (typeof ack === "function") ack({ ok: false });
       }
     });
 
