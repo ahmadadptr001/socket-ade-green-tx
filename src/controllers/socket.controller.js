@@ -11,6 +11,11 @@ const messages = new Map(); // roomId -> [message]
 
 // CALL addition
 const activeCalls = new Map();
+// Tenggang waktu sebelum panggilan diakhiri saat salah satu pihak terputus.
+// Mencegah putus sesaat (mis. saat WebRTC dinyalakan ketika panggilan diangkat
+// memicu socket.io reconnect) langsung membatalkan panggilan yang baru saja
+// tersambung.
+const CALL_DISCONNECT_GRACE_MS = 15000;
 // callId -> {
 //   callId,
 //   fromUserId,
@@ -140,6 +145,26 @@ module.exports = (io) => {
 
   function getSocketIdsForUser(userId) {
     return Array.from(userSockets.get(userId) || []);
+  }
+
+  // Batalkan timer "akhiri panggilan" yang tertunda untuk user — dipanggil saat
+  // user reconnect/registrasi ulang supaya panggilan aktif tidak ikut batal
+  // hanya karena putus sesaat saat panggilan diangkat.
+  function clearPendingCallEnd(userId) {
+    if (userId == null) return;
+    const uid = String(userId);
+    for (const call of activeCalls.values()) {
+      const isParty =
+        String(call.fromUserId) === uid || String(call.toUserId) === uid;
+      if (isParty && call._endTimer) {
+        clearTimeout(call._endTimer);
+        call._endTimer = null;
+        log("clearPendingCallEnd - reconnect, panggilan dipertahankan", {
+          callId: call.callId,
+          userId: uid,
+        });
+      }
+    }
   }
 
   function persistMessage(msg) {
@@ -357,6 +382,9 @@ module.exports = (io) => {
         socket.role = role || "user";
 
         registerSocketForUser(socket.userId, socket.id);
+        // Jika user reconnect saat masih ada panggilan aktif (mis. socket sempat
+        // putus ketika panggilan diangkat), batalkan rencana pengakhiran call.
+        clearPendingCallEnd(socket.userId);
 
         // 🔑 BUAT STREAM TOKEN
         const streamToken = createStreamToken(socket.userId);
@@ -456,6 +484,7 @@ module.exports = (io) => {
         if (id) {
           socket.userId = id;
           registerSocketForUser(String(id), socket.id);
+          clearPendingCallEnd(id);
         }
 
         log("driver:online", {
@@ -1291,24 +1320,49 @@ module.exports = (io) => {
       try {
         log("disconnect", { socketId: socket.id, userId: socket.userId });
 
-        // akhiri panggilan aktif yang melibatkan user ini (cegah call zombie)
+        // Akhiri panggilan aktif yang melibatkan user ini — TAPI jangan agresif.
+        // Putus sesaat (mis. socket.io reconnect saat WebRTC dinyalakan ketika
+        // panggilan diangkat) TIDAK boleh langsung membatalkan panggilan yang
+        // baru tersambung. Pakai cek "masih ada socket lain" + tenggang waktu.
         if (socket.userId) {
+          const callUid = String(socket.userId);
           for (const [cId, call] of Array.from(activeCalls.entries())) {
             const isParty =
-              String(call.fromUserId) === String(socket.userId) ||
-              String(call.toUserId) === String(socket.userId);
+              String(call.fromUserId) === callUid ||
+              String(call.toUserId) === callUid;
             if (!isParty) continue;
-            const other =
-              String(call.fromUserId) === String(socket.userId)
-                ? call.toUserId
-                : call.fromUserId;
-            getSocketIdsForUser(String(other)).forEach((sid) => {
-              io.to(sid).emit("call:ended", {
-                callId: cId,
-                reason: "peer_disconnected",
+
+            // Masih ada koneksi lain milik user ini? Berarti belum benar-benar
+            // offline (mis. socket lama putus, socket baru sudah masuk) -> skip.
+            const remaining = getSocketIdsForUser(callUid).filter(
+              (sid) => sid !== socket.id,
+            );
+            if (remaining.length > 0) continue;
+
+            // Beri tenggang untuk reconnect sebelum benar-benar mengakhiri.
+            // Dibatalkan oleh clearPendingCallEnd() jika user kembali.
+            if (call._endTimer) continue;
+            call._endTimer = setTimeout(() => {
+              call._endTimer = null;
+              if (!activeCalls.has(cId)) return;
+              // Sudah reconnect dalam masa tenggang? jangan akhiri.
+              if (getSocketIdsForUser(callUid).length > 0) return;
+              const other =
+                String(call.fromUserId) === callUid
+                  ? call.toUserId
+                  : call.fromUserId;
+              getSocketIdsForUser(String(other)).forEach((sid) => {
+                io.to(sid).emit("call:ended", {
+                  callId: cId,
+                  reason: "peer_disconnected",
+                });
               });
-            });
-            activeCalls.delete(cId);
+              activeCalls.delete(cId);
+              log("call ended after disconnect grace", {
+                callId: cId,
+                userId: callUid,
+              });
+            }, CALL_DISCONNECT_GRACE_MS);
           }
         }
 
