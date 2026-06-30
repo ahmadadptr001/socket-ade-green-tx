@@ -62,6 +62,54 @@ setInterval(() => {
   } catch {}
 }, 10 * 1000);
 
+// JANITOR: cegah pertumbuhan memori tanpa batas pada proses long-running.
+// State in-memory (messages/qrRides/driverLastSeen) tak pernah dibersihkan
+// sendiri, jadi entri basi dibuang berkala.
+const STALE_MS = {
+  messageRoom: 6 * 60 * 60 * 1000, // 6 jam tanpa pesan baru -> buang room
+  qrRide: 2 * 60 * 60 * 1000, // 2 jam sesi QR non-aktif -> buang
+  driverLastSeen: 24 * 60 * 60 * 1000, // 24 jam driver offline -> buang
+};
+setInterval(() => {
+  try {
+    const nowMs = Date.now();
+    let purged = 0;
+
+    for (const [roomId, list] of messages.entries()) {
+      // Jangan buang histori chat milik ride / sesi QR yang MASIH aktif
+      // (room chat memakai rideId: chat:join(rideId) / chat:send{roomId:rideId}).
+      // Hanya room non-aktif & basi yang dibuang.
+      if (rides.has(roomId) || qrRides.has(roomId)) continue;
+      const last = list[list.length - 1];
+      const ts = last ? Date.parse(last.createdAt) : 0;
+      if (!list.length || nowMs - ts > STALE_MS.messageRoom) {
+        messages.delete(roomId);
+        purged++;
+      }
+    }
+
+    for (const [rideId, qr] of qrRides.entries()) {
+      const ts = Date.parse(qr.updatedAt || qr.createdAt || 0) || 0;
+      if (qr.status !== "active" && nowMs - ts > STALE_MS.qrRide) {
+        qrRides.delete(rideId);
+        purged++;
+      }
+    }
+
+    for (const [id, d] of driverLastSeen.entries()) {
+      const ts = Date.parse(d.lastSeen || 0) || 0;
+      if (!d.online && nowMs - ts > STALE_MS.driverLastSeen) {
+        driverLastSeen.delete(id);
+        purged++;
+      }
+    }
+
+    if (purged) log("janitor purged stale entries", { purged });
+  } catch (e) {
+    log("janitor error", e?.message ?? e);
+  }
+}, 5 * 60 * 1000);
+
 module.exports = (io) => {
   // helper: broadcast daftar driver ke semua client.
   // DI-THROTTLE (leading + trailing, maks 1x / 1.5s) supaya saat banyak driver
@@ -733,13 +781,36 @@ module.exports = (io) => {
       }
     });
 
-    // chat history
+    // chat history (paginasi: `before` = id pesan ATAU createdAt ISO)
     socket.on("chat:history", ({ roomId, limit = 50, before } = {}, ack) => {
       try {
         if (!roomId) return ack?.({ ok: false, reason: "invalid_room" });
         const list = messages.get(roomId) || [];
-        // naive pagination: return last `limit` messages, ignoring `before` for now
-        const result = list.slice(-limit);
+
+        let slice = list;
+        if (before != null) {
+          // `before` bisa berupa id pesan ATAU timestamp ISO.
+          let idx = list.findIndex((m) => m.id === before);
+
+          // Fallback timestamp HANYA bila `before` benar-benar tampak seperti
+          // tanggal ISO — BUKAN id pesan (id = `${Date.now()}_${rand}`, selalu
+          // mengandung '_'). Tanpa cek ini, id yang tak ditemukan akan salah
+          // dibandingkan sebagai tanggal ("2026-..." >= "1719_..." -> true di
+          // indeks 0) sehingga mengembalikan halaman KOSONG.
+          const looksLikeTimestamp =
+            typeof before === "string" &&
+            !before.includes("_") &&
+            !Number.isNaN(Date.parse(before));
+          if (idx === -1 && looksLikeTimestamp) {
+            const beforeMs = Date.parse(before);
+            idx = list.findIndex((m) => Date.parse(m.createdAt) >= beforeMs);
+          }
+
+          // idx tak ditemukan (cursor asing) -> kembalikan halaman terakhir.
+          slice = idx > 0 ? list.slice(0, idx) : idx === 0 ? [] : list;
+        }
+
+        const result = slice.slice(-limit);
         ack?.({ ok: true, messages: result });
       } catch (e) {
         log("chat:history error", e?.message ?? e);
