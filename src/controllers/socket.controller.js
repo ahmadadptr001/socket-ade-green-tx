@@ -9,6 +9,13 @@ const onlineCustomers = new Map(); // socketId -> { socketId, lastSeen, meta }
 const userSockets = new Map(); // userId -> Set(socketId)
 const messages = new Map(); // roomId -> [message]
 
+// SUPPORT CHAT (live chat ke admin) — sesi EPHEMERAL: hilang saat berakhir
+// atau saat user terputus. Tidak ada persistensi (sesuai kebutuhan).
+const supportSessions = new Map();
+// sessionId -> { sessionId, userId, role:'customer'|'driver', name,
+//   status:'waiting'|'active'|'ended', adminId, createdAt, messages:[] }
+const supportAdmins = new Set(); // socketId admin yang online di panel
+
 // CALL addition
 const activeCalls = new Map();
 // Tenggang waktu sebelum panggilan diakhiri saat salah satu pihak terputus.
@@ -193,6 +200,37 @@ module.exports = (io) => {
 
   function getSocketIdsForUser(userId) {
     return Array.from(userSockets.get(userId) || []);
+  }
+
+  // --- SUPPORT CHAT helpers ---
+  function serializeSession(s) {
+    return {
+      sessionId: s.sessionId,
+      userId: s.userId,
+      role: s.role,
+      name: s.name,
+      status: s.status,
+      adminId: s.adminId ?? null,
+      createdAt: s.createdAt,
+      unread: s.messages.filter((m) => m.role !== "admin").length,
+      lastText: s.messages.length
+        ? s.messages[s.messages.length - 1].text
+        : null,
+      lastAt: s.messages.length
+        ? s.messages[s.messages.length - 1].createdAt
+        : s.createdAt,
+    };
+  }
+  // Kirim antrian sesi support terkini ke semua admin yang online.
+  function emitSupportQueue() {
+    try {
+      const list = Array.from(supportSessions.values()).map(serializeSession);
+      for (const sid of supportAdmins) {
+        io.to(sid).emit("support:queue", { ok: true, sessions: list });
+      }
+    } catch (e) {
+      log("emitSupportQueue error", e?.message ?? e);
+    }
   }
 
   // Batalkan timer "akhiri panggilan" yang tertunda untuk user — dipanggil saat
@@ -850,6 +888,173 @@ module.exports = (io) => {
       }
     });
 
+    // ===========================================================
+    // SUPPORT CHAT — live chat user (customer/driver) <-> admin.
+    // Alur: user "support:request" -> antri -> admin "support:accept"
+    // -> chat via "support:message" -> "support:end" (sesi & pesan dihapus).
+    // ===========================================================
+
+    // Admin panel online: daftar untuk menerima antrian + dapat snapshot awal.
+    socket.on("support:admin:join", (_payload, ack) => {
+      try {
+        supportAdmins.add(socket.id);
+        socket.isSupportAdmin = true;
+        const list = Array.from(supportSessions.values()).map(serializeSession);
+        log("support:admin:join", {
+          socketId: socket.id,
+          sessions: list.length,
+        });
+        if (typeof ack === "function") ack({ ok: true, sessions: list });
+        else socket.emit("support:queue", { ok: true, sessions: list });
+      } catch (e) {
+        log("support:admin:join error", e?.message ?? e);
+        if (typeof ack === "function") ack({ ok: false });
+      }
+    });
+
+    // Admin keluar dari panel.
+    socket.on("support:admin:leave", () => {
+      supportAdmins.delete(socket.id);
+      socket.isSupportAdmin = false;
+    });
+
+    // User (customer/driver) mengajukan sesi chat. Satu user = satu sesi aktif.
+    socket.on("support:request", ({ userId, role, name } = {}, ack) => {
+      try {
+        if (!userId) return ack?.({ ok: false, reason: "invalid_payload" });
+
+        let session = null;
+        for (const s of supportSessions.values()) {
+          if (String(s.userId) === String(userId) && s.status !== "ended") {
+            session = s;
+            break;
+          }
+        }
+        if (!session) {
+          session = {
+            sessionId: `sup_${Date.now()}_${Math.random()
+              .toString(36)
+              .slice(2, 7)}`,
+            userId: String(userId),
+            role: role === "driver" ? "driver" : "customer",
+            name: name || "Pengguna",
+            status: "waiting",
+            adminId: null,
+            createdAt: now(),
+            messages: [],
+          };
+          supportSessions.set(session.sessionId, session);
+        }
+
+        socket.userId = String(userId);
+        registerSocketForUser(String(userId), socket.id);
+        socket.join(session.sessionId);
+        socket.supportSessionId = session.sessionId;
+
+        log("support:request", {
+          sessionId: session.sessionId,
+          role: session.role,
+          status: session.status,
+        });
+        emitSupportQueue();
+        ack?.({
+          ok: true,
+          sessionId: session.sessionId,
+          status: session.status,
+          adminId: session.adminId ?? null,
+          messages: session.messages,
+        });
+      } catch (e) {
+        log("support:request error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Admin menerima/melayani sebuah sesi (memilih dari antrian).
+    socket.on("support:accept", ({ sessionId, adminId } = {}, ack) => {
+      try {
+        const s = supportSessions.get(sessionId);
+        if (!s) return ack?.({ ok: false, reason: "not_found" });
+
+        s.status = "active";
+        s.adminId = adminId ?? "admin";
+        supportSessions.set(sessionId, s);
+        socket.join(sessionId);
+
+        getSocketIdsForUser(String(s.userId)).forEach((sid) =>
+          io.to(sid).emit("support:accepted", {
+            sessionId,
+            adminId: s.adminId,
+          }),
+        );
+        emitSupportQueue();
+        log("support:accept", { sessionId, adminId: s.adminId });
+        ack?.({ ok: true, session: serializeSession(s), messages: s.messages });
+      } catch (e) {
+        log("support:accept error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Kirim pesan dalam sesi (dari user ATAU admin).
+    socket.on("support:message", ({ sessionId, from, role, text } = {}, ack) => {
+      try {
+        const s = supportSessions.get(sessionId);
+        if (!s || !text) return ack?.({ ok: false, reason: "invalid_payload" });
+
+        const msg = {
+          id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          sessionId,
+          from: from ?? null,
+          role: role === "admin" ? "admin" : "user",
+          text,
+          createdAt: now(),
+        };
+        s.messages.push(msg);
+        if (s.messages.length > 500) {
+          s.messages.splice(0, s.messages.length - 500);
+        }
+        supportSessions.set(sessionId, s);
+
+        io.to(sessionId).emit("support:message", msg);
+        emitSupportQueue();
+        ack?.({ ok: true, messageId: msg.id });
+      } catch (e) {
+        log("support:message error", e?.message ?? e);
+        ack?.({ ok: false, reason: "internal_error" });
+      }
+    });
+
+    // Indikator mengetik (opsional).
+    socket.on("support:typing", ({ sessionId, role, isTyping } = {}) => {
+      try {
+        if (!sessionId) return;
+        socket.to(sessionId).emit("support:typing", {
+          sessionId,
+          role,
+          isTyping: !!isTyping,
+        });
+      } catch (e) {
+        log("support:typing error", e?.message ?? e);
+      }
+    });
+
+    // Akhiri sesi -> beri tahu kedua pihak, lalu HAPUS sesi + semua pesan.
+    socket.on("support:end", ({ sessionId, by } = {}, ack) => {
+      try {
+        const s = supportSessions.get(sessionId);
+        if (!s) return ack?.({ ok: true });
+        io.to(sessionId).emit("support:ended", { sessionId, by: by ?? null });
+        supportSessions.delete(sessionId);
+        emitSupportQueue();
+        log("support:end", { sessionId, by });
+        ack?.({ ok: true });
+      } catch (e) {
+        log("support:end error", e?.message ?? e);
+        ack?.({ ok: false });
+      }
+    });
+
     // ------------------------
     // --- existing ride events continue ---
     // ------------------------
@@ -1390,6 +1595,28 @@ module.exports = (io) => {
     socket.on("disconnect", () => {
       try {
         log("disconnect", { socketId: socket.id, userId: socket.userId });
+
+        // --- SUPPORT CHAT cleanup ---
+        // Admin keluar dari daftar penerima antrian.
+        if (socket.isSupportAdmin) supportAdmins.delete(socket.id);
+        // Sesi milik user yang benar-benar offline -> akhiri (ephemeral).
+        if (socket.userId) {
+          const supUid = String(socket.userId);
+          const remainingSup = getSocketIdsForUser(supUid).filter(
+            (x) => x !== socket.id,
+          );
+          if (remainingSup.length === 0) {
+            for (const [sid, s] of Array.from(supportSessions.entries())) {
+              if (String(s.userId) !== supUid) continue;
+              io.to(sid).emit("support:ended", {
+                sessionId: sid,
+                by: "user_disconnect",
+              });
+              supportSessions.delete(sid);
+              emitSupportQueue();
+            }
+          }
+        }
 
         // Akhiri panggilan aktif yang melibatkan user ini — TAPI jangan agresif.
         // Putus sesaat (mis. socket.io reconnect saat WebRTC dinyalakan ketika
