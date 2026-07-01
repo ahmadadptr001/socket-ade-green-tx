@@ -30,16 +30,28 @@ exports.sendNotification = async (req, res) => {
 
     const result = await response.json();
 
-    // Expo balas error
-    if (result?.data?.status === "error") {
+    // Expo bisa membalas OBJECT (1 pesan) atau ARRAY (banyak). Dulu hanya cek
+    // `result.data.status` -> untuk ARRAY selalu undefined -> error per-tiket
+    // (DeviceNotRegistered / MismatchSenderId / dll) TERLEWAT & tetap "sukses".
+    const tickets = Array.isArray(result?.data)
+      ? result.data
+      : result?.data
+        ? [result.data]
+        : [];
+    const errors = tickets.filter((t) => t?.status === "error");
+
+    if (errors.length) {
+      // details.error umum: "DeviceNotRegistered" (token basi),
+      // "MismatchSenderId"/"InvalidCredentials" (kredensial FCM di Expo salah).
+      console.error("EXPO PUSH TICKET ERRORS:", JSON.stringify(errors));
       return res.status(400).json({
         status: 400,
-        message: result.data.message,
-        details: result.data.details,
+        message: errors[0].message || "Sebagian/semua notifikasi gagal dikirim",
+        errors,
       });
     }
 
-    // Berhasil
+    // Diterima Expo (BUKAN jaminan sampai ke HP — cek receipt untuk delivery).
     return res.json({
       status: 200,
       message: "Notifikasi terkirim",
