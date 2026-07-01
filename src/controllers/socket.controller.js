@@ -9,6 +9,10 @@ const onlineCustomers = new Map(); // socketId -> { socketId, lastSeen, meta }
 const userSockets = new Map(); // userId -> Set(socketId)
 const messages = new Map(); // roomId -> [message]
 
+// PUSH panggilan: userId -> Expo push token. DIPERTAHANKAN walau user disconnect
+// supaya callee yang app-nya TERTUTUP tetap bisa dikirimi notifikasi panggilan.
+const userPushTokens = new Map();
+
 // SUPPORT CHAT (live chat ke admin) — sesi EPHEMERAL: hilang saat berakhir
 // atau saat user terputus. Tidak ada persistensi (sesuai kebutuhan).
 const supportSessions = new Map();
@@ -263,6 +267,34 @@ module.exports = (io) => {
     return msg;
   }
 
+  // Kirim PUSH panggilan (Expo) ke callee yang app-nya kemungkinan TERTUTUP
+  // (tidak punya socket aktif). Butuh Node 18+ (global fetch).
+  async function sendCallPush(toUserId, fromName) {
+    try {
+      const token = userPushTokens.get(String(toUserId));
+      if (!token) return;
+      await fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          to: token,
+          title: "Panggilan Masuk",
+          body: `${fromName || "Seseorang"} sedang menelepon Anda. Ketuk untuk membuka.`,
+          sound: "default",
+          priority: "high",
+          channelId: "calls",
+          data: { type: "call" },
+        }),
+      });
+      log("sendCallPush sent", { toUserId });
+    } catch (e) {
+      log("sendCallPush error", e?.message ?? e);
+    }
+  }
+
   io.on("connection", (socket) => {
     log("connection established", {
       socketId: socket.id,
@@ -329,6 +361,12 @@ module.exports = (io) => {
             roomId,
           });
         });
+
+        // Callee TANPA socket aktif (app kemungkinan tertutup) -> kirim PUSH
+        // agar tetap tahu ada panggilan masuk (socket mati = tak dapat call:incoming).
+        if (targetSockets.length === 0) {
+          sendCallPush(toUserId, socket.displayName);
+        }
 
         log("call:invite sent", call);
 
@@ -457,7 +495,7 @@ module.exports = (io) => {
     );
 
     // --- CHAT: optional explicit register (client can emit after connect) ---
-    socket.on("chat:register", ({ userId, role }, ack) => {
+    socket.on("chat:register", ({ userId, role, expoPushToken, name }, ack) => {
       try {
         if (!userId) {
           return ack?.({ ok: false, message: "userId required" });
@@ -466,8 +504,11 @@ module.exports = (io) => {
         // simpan ke socket memory
         socket.userId = String(userId);
         socket.role = role || "user";
+        if (name) socket.displayName = name;
 
         registerSocketForUser(socket.userId, socket.id);
+        // Simpan token push untuk notifikasi panggilan saat app tertutup.
+        if (expoPushToken) userPushTokens.set(socket.userId, expoPushToken);
         // Jika user reconnect saat masih ada panggilan aktif (mis. socket sempat
         // putus ketika panggilan diangkat), batalkan rencana pengakhiran call.
         clearPendingCallEnd(socket.userId);
