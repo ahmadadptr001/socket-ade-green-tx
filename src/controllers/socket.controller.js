@@ -513,6 +513,21 @@ module.exports = (io) => {
         // putus ketika panggilan diangkat), batalkan rencana pengakhiran call.
         clearPendingCallEnd(socket.userId);
 
+        // Ada panggilan MASUK yang MASIH berdering untuk user ini? (mis. app baru
+        // dibuka dari notifikasi push saat sebelumnya socket mati) -> kirim ulang
+        // call:incoming ke socket ini supaya UI panggilan langsung muncul.
+        try {
+          for (const c of activeCalls.values()) {
+            if (String(c.toUserId) === socket.userId && c.status === "ringing") {
+              io.to(socket.id).emit("call:incoming", {
+                callId: c.callId,
+                fromUserId: c.fromUserId,
+                roomId: c.roomId,
+              });
+            }
+          }
+        } catch {}
+
         // 🔑 BUAT STREAM TOKEN
         const streamToken = createStreamToken(socket.userId);
 
